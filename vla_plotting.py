@@ -5,10 +5,12 @@ from pathlib import Path
 from copy import deepcopy
 
 import numpy as np
+import scipy as sp
 import pandas as pd
 from skimage import morphology
 from matplotlib import pyplot as plt
 from matplotlib import (patheffects, colors)
+from matplotlib.ticker import AutoMinorLocator
 
 import aplpy
 import radio_beam
@@ -39,9 +41,12 @@ VIR_CMAP = plt.cm.viridis
 VIR_CMAP.set_bad('0.5', 1.0)
 
 
-def open_fits(filen):
-    hdul = fits.open(PDir.ROOT / Path(filen))
-    return hdul
+def open_fits(filen, relative=True):
+    path = Path(filen).expanduser()
+    if relative:
+        return fits.open(PDir.ROOT / path)
+    else:
+        return fits.open(path)
 
 
 def default_mask(hdul):
@@ -78,8 +83,11 @@ def add_label(label, xy, fontsize=10):
     return txt
 
 
-def save_figure(filen):
-    for ext in ('png', 'pdf', 'eps'):
+def save_figure(filen, do_eps=True):
+    exts = ['png', 'pdf']
+    if do_eps:
+        exts.append('eps')
+    for ext in exts:
         path = PDir.PLT / Path('{0}.{1}'.format(filen, ext))
         plt.savefig(str(path), dpi=300)
         print('-- {0} saved'.format(ext))
@@ -131,6 +139,9 @@ def zero_out_corners(hdu):
 
 
 def plot_four_moments(source, mol, matched=True):
+    # FIXME due to issues with having 3 axes from STOKES/RA/DEC, `aplpy==2.0.1`
+    # does not work and must currently fall-back to `aplpy==1.1.1` that does
+    # not wrap the new WCSAxes module in astropy
     filen = 'moments/{0}/{0}_{1}'.format(source, mol)
     img0 = open_fits(filen + '_snr2_smooth0.integrated.pbcor.fits')
     pb = open_fits('images/{0}/{0}_{1}_joint.pb.fits'.format(source, mol))
@@ -244,6 +255,7 @@ def plot_four_moments_all():
 
 class ParmapHandler:
     filen = 'property_maps/{0}/{0}_nh3_parmap.fits'
+    filen_relative = True
     props = {
             'tkin': 0, 'e_tkin':  6,
             'texc': 1, 'e_texc':  7,
@@ -251,17 +263,40 @@ class ParmapHandler:
             'sigm': 3, 'e_sigm':  9,
             'vcen': 4, 'e_vcen': 10,
     }
+    labels = {
+              'tkin': r'$T_\mathrm{K} \ [\mathrm{K}]$',
+            'e_tkin': r'$\delta T_\mathrm{K} \ [\mathrm{K}]$',
+              'texc': r'$T_\mathrm{ex} \ [\mathrm{K}]$',
+            'e_texc': r'$\delta T_\mathrm{ex} \ [\mathrm{K}]$',
+              'ncol': r'$\log(N(\mathrm{p\hbox{-}NH_3})) \ [\mathrm{cm^{-2}}]$',
+            'e_ncol': r'$\delta \log(N(\mathrm{p\hbox{-}NH_3})) \ [\mathrm{cm^{-2}}]$',
+              'sigm': r'$\sigma_v \ [\mathrm{km\, s^{-1}}]$',
+            'e_sigm': r'$\delta \sigma_v \ [\mathrm{km\, s^{-1}}]$',
+              'vcen': r'$v_\mathrm{lsr} \ [\mathrm{km\, s^{-1}}]$',
+            'e_vcen': r'$\delta v_\mathrm{lsr} \ [\mathrm{km\, s^{-1}}]$',
+              'trot': r'$T_\mathrm{rot} \ [\mathrm{K}]$',
+            'e_trot': r'$\delta T_\mathrm{rot} \ [\mathrm{K}]$',
+    }
+    vsys = VELOS
     err_offset = 6
     bad_thresh = 1e3
 
     def __init__(self, source):
+        """
+        Parameters
+        ----------
+
+        source : str
+            Source name, ex. 'G24051'
+        """
         self.source = source
-        self.hdul = open_fits(self.filen.format(source))
+        self.hdul = open_fits(self.filen.format(source), relative=self.filen_relative)
         self.header = self.hdul[0].header
         self.wcs = wcs.WCS(self.hdul[0].header)
-        self.clean_hdul()
+        self._clean_hdul()
+        self.vsystem = self.vsys[source]
 
-    def clean_hdul(self):
+    def _clean_hdul(self):
         ncol = self.get_hdu('ncol').data.copy()
         e_ncol = self.get_hdu('e_ncol').data.copy()
         ncol[(e_ncol > 0.5) | (ncol > 16.9)] = np.nan
@@ -270,18 +305,97 @@ class ParmapHandler:
         for ii in range(5):
             data[ii][mask] = np.nan
 
-    def get_hdu(self, prop, snr_thresh=3):
+    def get_label(self, prop):
+        return self.labels[prop]
+
+    def get_hdu(self, prop, snr_thresh=3, rel_velo=False):
+        """
+        Parameters
+        ----------
+        prop : str
+        snr_thresh : number, default 3
+            SNR cut for pixel selection based on the parameter's associated fit
+            uncertainty value.
+        rel_velo : bool, default False
+            Subtract the source systemic velocity from the velocity centroid
+            values.
+        """
+        # The values came from the cold_ammonia model which uses the Swift
+        # (2005) approximation, so to return rotation temperature, just apply
+        # equation A6.
+        do_rot_conv = prop == 'trot'
+        if do_rot_conv:
+            prop = 'tkin'
+        if prop == 'e_trot':
+            prop = 'e_tkin'
         ix = self.props[prop]
         data = self.hdul[0].data[ix:ix+1,:,:]
         data[data == 0] = np.nan
         data[data > self.bad_thresh] = np.nan
+        if do_rot_conv:
+            dT0 = 41.18  # (2,2)-(1,1) energy difference in K
+            data = data*(1 + (data/dT0)*np.log(1 + 0.6*np.exp(-15.7/data)))**(-1)
         if not prop.startswith('e_'):
             ix_e = ix + self.err_offset
             err = self.hdul[0].data[ix_e:ix_e+1,:,:]
-            data[data / err < snr_thresh] = np.nan
+            data[np.abs(data / err) < snr_thresh] = np.nan
+        if rel_velo and prop == 'vcen':
+            data -= self.vsystem
         header = self.header.copy()
         hdu = fits.PrimaryHDU(data=data, header=self.header)
         return hdu
+
+
+class GasParmapHandler(ParmapHandler):
+    filen = '~/data1/datasets/gbt_gas/{0}_parameter_maps_DR1_rebase3_flag.fits'
+    filen_relative = False
+    vsys = {'OrionA': 9.5}
+
+    def _clean_hdul(self):
+        e_ncol = self.get_hdu('e_ncol').data
+        mask = np.squeeze(e_ncol > 0.25)
+        data = self.hdul[0].data
+        for ii in range(5):
+            data[ii][mask] = np.nan
+
+
+class KeystoneParmapHandler(ParmapHandler):
+    filen = '~/data1/datasets/keystone/{0}_parameter_maps_all_rebase_multi.fits'
+    filen_relative = False
+    vsys = {
+            'CygX_N':    4.2,  # km/s
+            'CygX_S':    2.0,
+            'M16':      21.2,
+            'M17':      19.2,
+            'MonR1':     5.1,
+            'MonR2':    10.2,
+            'NGC2264':   6.3,
+            'NGC7538': -53.6,
+            'Rosette':  13.4,
+            'W3':      -43.9,
+            'W3_west': -36.1,
+            'W48':      36.3,
+            }
+
+    def _clean_hdul(self):
+        data = self.hdul[0].data
+        for ii in range(5):
+            data[ii][(data[ii] == 0.0) & (data[ii+6] == 0.0)] = np.nan
+        mask = (
+                # tkin
+                (data[0] < 5) | (data[0] > 40) |
+                (data[6] > 5) |
+                # ncol
+                (data[2] < 12.1) | (data[2] > 16) |
+                (data[8] > 2) |
+                # sigm
+                (data[3] < 0.051) | (data[3] > 2.0) |
+                (data[9] > 2) |
+                # vcen
+                (data[10] > 1)
+        )
+        for ii in range(5):
+            data[ii][mask] = np.nan
 
 
 def plot_four_nh3_properties(source):
@@ -358,5 +472,253 @@ def plot_four_nh3_properties_all():
             continue
         print(':: ', source)
         plot_four_nh3_properties(source)
+
+
+def plot_prop_pdf_stack(source):
+    pmh = ParmapHandler(source)
+    props = ['tkin', 'texc', 'ncol', 'sigm', 'vcen']
+    all_bins = [
+            np.linspace(lo, hi, 100)
+            for lo, hi in [
+                ( 7.0, 25.0),  # tkin, K
+                ( 2.7, 15.0),  # texc, K
+                (12.0, 17.0),  # ncol, log(cm^-2)
+                ( 0.0,  2.0),  # sigm, km/s
+                (-3.0,  3.0),  # vcen, km/s (relative)
+            ]
+    ]
+    fig, axes = plt.subplots(ncols=1, nrows=len(props), figsize=(4, 6))
+    for prop, bins, ax in zip(props, all_bins, axes):
+        data = pmh.get_hdu(prop, rel_velo=True).data
+        vals = data.flatten()
+        med = np.nanmedian(vals)
+        qlo = np.nanquantile(vals, 0.165)
+        qhi = np.nanquantile(vals, 0.835)
+        hist, _, _ = ax.hist(vals, bins=bins, density=True, color='0.3')
+        ax.vlines([qlo, med, qhi], 0, hist.max(),
+                linestyles=['dotted', 'dashed', 'dotted'], colors='red',
+        )
+        ax.set_xlim(bins.min(), bins.max())
+        ax.set_xlabel(pmh.get_label(prop))
+    ax.set_ylabel('PDF')
+    plt.tight_layout(h_pad=0.5)
+    save_figure(f'{source}_prop_pdf_stack', do_eps=False)
+
+
+def plot_prop_pdf_stack_all():
+    for source in TARGETS:
+        if source == 'G285_mosaic':
+            continue
+        print(':: ', source)
+        plot_prop_pdf_stack(source)
+
+
+def plot_prop_sum_pdf_stack():
+    targets = [s for s in TARGETS if s != 'G285_mosaic']
+    all_pmh = [ParmapHandler(s) for s in targets]
+    ori_pmh = GasOrionParmapHandler()
+    props = ['tkin', 'texc', 'ncol', 'sigm', 'vcen']
+    all_bins = [
+            np.linspace(lo, hi, 100)
+            for lo, hi in [
+                ( 7.0, 30.0),  # tkin, K
+                ( 2.7, 12.0),  # texc, K
+                (12.0, 17.0),  # ncol, log(cm^-2)
+                ( 0.0,  2.0),  # sigm, km/s
+                (-3.0,  3.0),  # vcen, km/s (relative)
+            ]
+    ]
+    fig, axes = plt.subplots(ncols=1, nrows=len(props), figsize=(4, 6))
+    for prop, bins, ax in zip(props, all_bins, axes):
+        vals = np.array(list(
+                pmh.get_hdu(prop, rel_velo=True).data for pmh in all_pmh
+        )).flatten()
+        ovals = ori_pmh.get_hdu(prop, rel_velo=True).data.flatten()
+        med = np.nanmedian(vals)
+        qlo = np.nanquantile(vals, 0.165)
+        qhi = np.nanquantile(vals, 0.835)
+        hist, _, _ = ax.hist(vals, bins=bins, density=True, color='0.3')
+        ohist, _, _ = ax.hist(ovals, bins=bins, density=True, histtype='step',
+                color='darkorange')
+        ax.vlines([qlo, med, qhi], 0, max(ohist.max(), hist.max()),
+                linestyles=['dotted', 'dashed', 'dotted'], colors='red',
+        )
+        ax.set_xlim(bins.min(), bins.max())
+        ax.set_xlabel(all_pmh[0].get_label(prop))
+    ax.set_ylabel('PDF')
+    plt.tight_layout(h_pad=0.5)
+    save_figure(f'sum_prop_pdf_stack', do_eps=False)
+
+
+def plot_priors_pdf_stack(all_pmh=None):
+    targets = [s for s in TARGETS if s != 'G285_mosaic']
+    if all_pmh is None:
+        all_pmh = [ParmapHandler(s) for s in targets]
+    props = ['trot', 'texc', 'ncol', 'sigm', 'vcen']
+    nbins = 200
+    all_bins = [
+            np.linspace(lo, hi, nbins)
+            for lo, hi in [
+                ( 7.0, 30.0),  # tkin, K
+                ( 2.7, 12.0),  # texc, K
+                (12.0, 17.0),  # ncol, log(cm^-2)
+                ( 0.0,  2.0),  # sigm, km/s
+                (-4.0,  4.0),  # vcen, km/s (relative)
+            ]
+    ]
+    x = np.linspace(0, 1, nbins)
+    all_priors = [
+            # tkin
+            #sp.stats.gamma.pdf(x, 4.5, scale=0.075),
+            # trot
+            sp.stats.gamma.pdf(x, 4.4, scale=0.070),
+            # texc
+            #(0.2 * sp.stats.beta.pdf(x, 3.0, 30) + 0.80 * sp.stats.beta.pdf(x, 2, 4)),
+            #sp.stats.betaprime.pdf(x, 2.0, 8),
+            #sp.stats.beta.pdf(x, 1.5, 4.0),
+            sp.stats.beta.pdf(x, 1.0, 2.5),
+            # ncol
+            sp.stats.beta.pdf(x, 16, 14),
+            # sigm
+            sp.stats.gamma.pdf(x, 1.5, loc=0.03, scale=0.2),
+            # vcen
+            sp.stats.beta.pdf(x, 5, 5),
+    ]
+    fig, axes = plt.subplots(ncols=1, nrows=len(props), figsize=(4, 6))
+    for prop, bins, prior, ax in zip(props, all_bins, all_priors, axes):
+        vals = np.array(list(
+                pmh.get_hdu(prop, rel_velo=True).data for pmh in all_pmh
+        )).flatten()
+        hist, _, _ = ax.hist(vals, bins=bins, density=True, color='0.3')
+        ax.plot(bins, prior*hist.max()/prior.max(), 'm-')
+        if prop == 'sigm':
+            ax.vlines([0.15], 0, hist.max()*1.1, color='dodgerblue',
+                    linestyle='dashed')
+        ax.set_ylim(0, hist.max()*1.1)
+        ax.set_xlim(bins.min(), bins.max())
+        ax.set_xlabel(all_pmh[0].get_label(prop))
+    dep_x = 3.0 * x + 0.7
+    dep_y = sp.stats.beta.pdf(x, 1.5, 3.5)
+    ax.plot(dep_x, dep_y*hist.max()/dep_y.max(), 'c-')
+    ax.set_ylabel('PDF')
+    plt.tight_layout(h_pad=0.5)
+    save_figure(f'priors_pdf_stack_trot_dep', do_eps=False)  # XXX
+
+
+def plot_keystone_priors_pdf_stack(all_pmh=None):
+    if all_pmh is None:
+        all_pmh = [
+                KeystoneParmapHandler(s)
+                for s in KeystoneParmapHandler.vsys.keys()
+        ]
+    props = ['trot', 'texc', 'ncol', 'sigm', 'vcen']
+    nbins = 100
+    all_bins = [
+            np.linspace(lo, hi, nbins)
+            for lo, hi in [
+                (  7.0, 30.0),  # tkin, K
+                (  2.9, 12.0),  # texc, K
+                ( 12.0, 17.0),  # ncol, log(cm^-2)
+                (  0.0,  2.0),  # sigm, km/s
+                (-10.0, 10.0),  # vcen, km/s (relative)
+            ]
+    ]
+    x = np.linspace(0, 1, nbins)
+    all_priors = [
+            # tkin
+            #sp.stats.gamma.pdf(x, 4.5, scale=0.075),
+            # trot
+            sp.stats.gamma.pdf(x, 4.4, scale=0.070),
+            # texc
+            #(0.2 * sp.stats.beta.pdf(x, 3.0, 30) + 0.80 * sp.stats.beta.pdf(x, 2, 4)),
+            #sp.stats.betaprime.pdf(x, 2.0, 8),
+            #sp.stats.beta.pdf(x, 1.5, 4.0),
+            sp.stats.beta.pdf(x, 1.0, 2.5),
+            # ncol
+            sp.stats.beta.pdf(x, 16, 14),
+            # sigm
+            sp.stats.gamma.pdf(x, 1.5, loc=0.03, scale=0.2),
+            # vcen
+            sp.stats.beta.pdf(x, 30, 30),
+    ]
+    fig, axes = plt.subplots(ncols=1, nrows=len(props), figsize=(4, 6))
+    for prop, bins, prior, ax in zip(props, all_bins, all_priors, axes):
+        for pmh in all_pmh:
+            vals = pmh.get_hdu(prop, rel_velo=True, snr_thresh=5).data.flatten()
+            hist, _, _ = ax.hist(vals, bins=bins, density=True, color='black', alpha=0.2)
+        ax.plot(bins, prior*hist.max()/prior.max(), 'm-')
+        ax.set_ylim(0, hist.max()*1.5)
+        ax.set_xlim(bins.min(), bins.max())
+        ax.set_xlabel(all_pmh[0].get_label(prop))
+    ax.set_ylabel('PDF')
+    plt.tight_layout(h_pad=0.5)
+    save_figure(f'priors_KS_pdf_stack_trot', do_eps=False)
+
+
+def plot_prop_err_pdf_stack(source):
+    pmh = ParmapHandler(source)
+    props = ['e_tkin', 'e_texc', 'e_ncol', 'e_sigm', 'e_vcen']
+    all_bins = [
+            np.logspace(np.log10(lo), np.log10(hi), 100)
+            for lo, hi in [
+                ( 1e-2, 10.0),  # tkin, K
+                ( 1e-2, 10.0),  # texc, K
+                ( 1e-2,  1.0),  # ncol, log(cm^-2)
+                ( 1e-3,  1.0),  # sigm, km/s
+                ( 1e-3,  1.0),  # vcen, km/s (relative)
+            ]
+    ]
+    fig, axes = plt.subplots(ncols=1, nrows=len(props), figsize=(4, 6))
+    for prop, bins, ax in zip(props, all_bins, axes):
+        data = pmh.get_hdu(prop).data
+        vals = data.flatten()
+        hist, _, _ = ax.hist(vals, bins=bins, density=True, color='0.3')
+        ax.set_xscale('log')
+        ax.set_xlim(bins.min(), bins.max())
+        ax.set_xlabel(pmh.get_label(prop))
+    ax.set_ylabel('PDF')
+    plt.tight_layout()
+    save_figure(f'{source}_prop_err_pdf_stack', do_eps=False)
+
+
+def plot_ncol_texc_hist2d(all_pmh=None):
+    if all_pmh is None:
+        all_pmh = [ParmapHandler(s) for s in TARGETS if s != 'G285_mosaic']
+    texc = np.concatenate([pmh.get_hdu('texc').data.flatten() for pmh in all_pmh])
+    ncol = np.concatenate([pmh.get_hdu('ncol').data.flatten() for pmh in all_pmh])
+    t_bins = np.linspace( 3.5,  8.0, 50)
+    n_bins = np.linspace(13.0, 15.5, 50)
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.hist2d(texc, ncol, bins=(t_bins, n_bins), cmin=1, cmap=CLR_CMAP)
+    ax.plot([3.5, 8], [14.05, 14.55], 'w-')
+    ax.plot([3.5, 8], [14.05, 14.55], 'k:')
+    ax.set_xlabel(ParmapHandler.labels['texc'])
+    ax.set_ylabel(ParmapHandler.labels['ncol'])
+    ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+    ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+    plt.tight_layout(h_pad=0.5)
+    save_figure(f'ncol_texc_hist2d', do_eps=False)
+
+
+def plot_keystone_ncol_texc_hist2d(all_pmh=None):
+    if all_pmh is None:
+        all_pmh = [
+                KeystoneParmapHandler(s)
+                for s in KeystoneParmapHandler.vsys.keys()
+        ]
+    texc = np.concatenate([pmh.get_hdu('texc').data.flatten() for pmh in all_pmh])
+    ncol = np.concatenate([pmh.get_hdu('ncol').data.flatten() for pmh in all_pmh])
+    t_bins = np.linspace( 3.5,  8.0, 50)
+    n_bins = np.linspace(13.0, 15.5, 50)
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.hist2d(texc, ncol, bins=(t_bins, n_bins), cmin=1, cmap=CLR_CMAP)
+    ax.plot([3.5, 8], [14.05, 14.55], 'w-')
+    ax.plot([3.5, 8], [14.05, 14.55], 'k:')
+    ax.set_xlabel(ParmapHandler.labels['texc'])
+    ax.set_ylabel(ParmapHandler.labels['ncol'])
+    ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+    ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+    plt.tight_layout(h_pad=0.5)
+    save_figure(f'KS_ncol_texc_hist2d', do_eps=False)
 
 
