@@ -561,8 +561,18 @@ def plot_priors_pdf_stack(all_pmh=None):
             for lo, hi in [
                 ( 7.0, 30.0),  # tkin, K
                 ( 2.7, 12.0),  # texc, K
-                (12.0, 17.0),  # ncol, log(cm^-2)
+                (12.5, 16.5),  # ncol, log(cm^-2)
                 ( 0.0,  2.0),  # sigm, km/s
+                (-4.0,  4.0),  # vcen, km/s (relative)
+            ]
+    ]
+    all_pbins = [
+            np.linspace(lo, hi, nbins)
+            for lo, hi in [
+                ( 7.0, 30.0),  # tkin, K
+                ( 2.8, 12.0),  # texc, K
+                (12.5, 16.5),  # ncol, log(cm^-2)
+                ( 0.067, 2.067),  # sigm, km/s
                 (-4.0,  4.0),  # vcen, km/s (relative)
             ]
     ]
@@ -571,38 +581,40 @@ def plot_priors_pdf_stack(all_pmh=None):
             # tkin
             #sp.stats.gamma.pdf(x, 4.5, scale=0.075),
             # trot
-            sp.stats.gamma.pdf(x, 4.4, scale=0.070),
+            #sp.stats.gamma.pdf(x, 4.4, scale=0.070),
+            sp.stats.beta.pdf(x, 3.0, 6.7),
             # texc
             #(0.2 * sp.stats.beta.pdf(x, 3.0, 30) + 0.80 * sp.stats.beta.pdf(x, 2, 4)),
             #sp.stats.betaprime.pdf(x, 2.0, 8),
             #sp.stats.beta.pdf(x, 1.5, 4.0),
             sp.stats.beta.pdf(x, 1.0, 2.5),
             # ncol
-            sp.stats.beta.pdf(x, 16, 14),
+            sp.stats.beta.pdf(x, 10.0, 8.5),
             # sigm
-            sp.stats.gamma.pdf(x, 1.5, loc=0.03, scale=0.2),
+            #sp.stats.gamma.pdf(x, 1.5, loc=0.03, scale=0.2),
+            sp.stats.beta.pdf(x, 1.5, 5.0),
             # vcen
             sp.stats.beta.pdf(x, 5, 5),
     ]
     fig, axes = plt.subplots(ncols=1, nrows=len(props), figsize=(4, 6))
-    for prop, bins, prior, ax in zip(props, all_bins, all_priors, axes):
+    for prop, bins, pbins, prior, ax in zip(props, all_bins, all_pbins, all_priors, axes):
         vals = np.array(list(
                 pmh.get_hdu(prop, rel_velo=True).data for pmh in all_pmh
         )).flatten()
         hist, _, _ = ax.hist(vals, bins=bins, density=True, color='0.3')
-        ax.plot(bins, prior*hist.max()/prior.max(), 'm-')
+        ax.plot(pbins, prior*hist.max()/prior.max(), 'm-')
         if prop == 'sigm':
-            ax.vlines([0.15], 0, hist.max()*1.1, color='dodgerblue',
+            ax.vlines([0.158/2.355], 0, hist.max()*1.1, color='dodgerblue',
                     linestyle='dashed')
         ax.set_ylim(0, hist.max()*1.1)
         ax.set_xlim(bins.min(), bins.max())
         ax.set_xlabel(all_pmh[0].get_label(prop))
-    dep_x = 3.0 * x + 0.7
-    dep_y = sp.stats.beta.pdf(x, 1.5, 3.5)
-    ax.plot(dep_x, dep_y*hist.max()/dep_y.max(), 'c-')
+    #dep_x = 3.0 * x + 0.7
+    #dep_y = sp.stats.beta.pdf(x, 1.5, 3.5)
+    #ax.plot(dep_x, dep_y*hist.max()/dep_y.max(), 'c-')
     ax.set_ylabel('PDF')
     plt.tight_layout(h_pad=0.5)
-    save_figure(f'priors_pdf_stack_trot_dep', do_eps=False)  # XXX
+    save_figure(f'priors_pdf_stack_trot', do_eps=False)
 
 
 def plot_keystone_priors_pdf_stack(all_pmh=None):
